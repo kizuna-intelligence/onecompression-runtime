@@ -12,6 +12,20 @@ pip install onecomp-runtime[gemlite]     # + GemLite int4 kernels
 pip install onecomp-runtime[diffusion]   # + diffusers (generic loader builds diffusers classes)
 ```
 
+## Supported models
+
+| Model | Modality | Backbone | Quant | Adapter | Weights |
+|---|---|---|---|---|---|
+| Irodori-TTS-500M-v3 | TTS | RF DiT + DAC-VAE | int4 GPTQ + RTN | Irodori-TTS-Lite | `kizuna-intelligence/Irodori-TTS-500M-v3-int4` |
+| FLUX.2-klein | text→image | DiT + Qwen3 TE + VAE | int4 GPTQ (QEP) | Flux2-klein-Lite | — |
+| LTX-2.3-22b | text→video | dual-stream DiT | int4 GPTQ | ltx2 | — |
+| Command-A-Plus | text MoE | Cohere2 MoE | int1/2/4 RTN | cmda offload | — |
+| FireRed-Image-Edit | image edit | 20B Qwen-Image | int4 GPTQ (QEP) | `models/firered` | `kizuna-intelligence/FireRed-Image-Edit-int4` |
+
+QEP = Fujitsu Quantization Error Propagation. New models plug in via a
+`build_meta_model` + `post_load` adapter; experimental backbones land here once
+verified end-to-end on a 24GB GPU.
+
 ## Why
 
 The int4 leaf machinery was copy-pasted across the FLUX.2 / LTX-2.3 / FireRed /
