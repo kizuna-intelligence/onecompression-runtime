@@ -6,6 +6,8 @@
   (fp16 I/O) for the same packed format.
 - :class:`PackedRTNLinear` / :class:`PackedEmbedding` — RTN uint8-nibble layers
   that dequantize on the fly (encoders, AdaLN extras, embedding tables).
+- :class:`Dsv4PackedLinear` / :func:`dequant_dsv4_packed` — int4/int2 packed Linear
+  for DeepSeek-V4-Flash QEP weights (offloadable MoE experts, on-the-fly dequant).
 - :class:`PackedInt4Conv1d` / :class:`PackedInt4ConvTranspose1d` /
   :func:`replace_conv_with_packed` — int4 conv layers (DAC-VAE style codecs).
 
@@ -23,6 +25,7 @@ from .packed_conv import (
     replace_conv_with_packed,
 )
 from .packed_linear import PackedEmbedding, PackedRTNLinear
+from .dsv4_packed_linear import Dsv4PackedLinear, dequant_dsv4_packed
 
 __all__ = [
     "FusedInt4Linear",
@@ -31,6 +34,8 @@ __all__ = [
     "gemlite_available",
     "PackedRTNLinear",
     "PackedEmbedding",
+    "Dsv4PackedLinear",
+    "dequant_dsv4_packed",
     "PackedInt4Conv1d",
     "PackedInt4ConvTranspose1d",
     "replace_conv_with_packed",
