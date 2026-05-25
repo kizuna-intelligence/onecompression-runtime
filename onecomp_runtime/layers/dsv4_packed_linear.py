@@ -84,6 +84,14 @@ class Dsv4PackedLinear(nn.Module):
                 "qzeros": self.qzeros, "wbits": self.wbits,
                 "groupsize": self.groupsize, "in_features": self.in_features}
 
+    @property
+    def weight(self) -> torch.Tensor:
+        """Dequantized dense (out, in) weight — for sites that read ``.weight``
+        directly (e.g. DSV4 ``wo_a`` einsum, model.py:538) rather than calling
+        the module. Materialized in bf16 on the packed buffers' device."""
+        return dequant_dsv4_packed(self._packed_dict(), dtype=torch.bfloat16,
+                                   device=self.qweight_packed.device)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = dequant_dsv4_packed(self._packed_dict(), dtype=x.dtype, device=x.device)
         bias = self.bias.to(x.dtype) if self.bias is not None else None

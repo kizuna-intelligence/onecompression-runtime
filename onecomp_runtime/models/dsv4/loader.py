@@ -82,9 +82,30 @@ class Dsv4QuantizedModel(nn.Module):
         self.norm_eps = self.args.norm_eps
         self.hc_eps = self.args.hc_eps
 
+    # -- aux-only block build (skip quantized-weight dequant) --------------
+    def _build_block_aux(self, L: int) -> nn.Module:
+        """Construct the bf16 ``Block`` and load ONLY non-quantized params
+        (norms, gate, hc mixing, attn_sink, compressor ape/norm). Every Linear
+        with a ``.scale`` sibling is replaced by a packed int4/int2 module right
+        after, so dequanting its fp4/fp8 weight from disk is pure waste — that
+        per-layer fp4 expert dequant was the ~130s/layer load bottleneck."""
+        block = self.M.Block(L, self.args)
+        prefix = f"layers.{L}."
+        sd = {}
+        for name in self.reader.weight_map:
+            if not name.startswith(prefix) or name.endswith(".scale"):
+                continue
+            short = name[len(prefix):]
+            if short.endswith(".weight") and self.reader.has(name.replace(".weight", ".scale")):
+                continue                            # quantized → packed swap covers it
+            sd[short] = self.reader.plain(name)
+        block.load_state_dict(sd, strict=False)
+        self._swap_linears(block, self.M)
+        return block.to(self.device).eval()
+
     # -- per-layer build + packed swap -------------------------------------
     def _load_block(self, L: int, qep_dir: str) -> nn.Module:
-        block = self._build_layer(L)               # real bf16 block (CastLinear)
+        block = self._build_block_aux(L)           # bf16 block, aux only (no expert dequant)
         saved = torch.load(f"{qep_dir}/layer_{L}.pt", map_location="cpu")
         modules = saved["modules"]
         named = dict(block.named_modules())
