@@ -21,6 +21,7 @@ pip install onecomp-runtime[diffusion]   # + diffusers (generic loader builds di
 | LTX-2.3-22b | text→video | dual-stream DiT | int4 GPTQ | ltx2 | — |
 | Command-A-Plus | text MoE | Cohere2 MoE | int1/2/4 RTN | cmda offload | — |
 | FireRed-Image-Edit | image edit | 20B Qwen-Image | int4 GPTQ (QEP) | `models/firered` | `kizuna-intelligence/FireRed-Image-Edit-int4` |
+| DeepSeek-V4-Flash | text MoE 284B | mHC/CSA + 256-expert | int4 dense + int2 experts (QEP) | `models/dsv4` | `kizuna-intelligence/DeepSeek-V4-Flash-int4-qep` |
 
 QEP = Fujitsu Quantization Error Propagation. New models plug in via a
 `build_meta_model` + `post_load` adapter; experimental backbones land here once
