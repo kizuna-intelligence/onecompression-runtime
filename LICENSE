@@ -2,9 +2,9 @@ MIT License
 
 Copyright (c) 2025-2026 Kizuna Intelligence
 
-The int4 kernels and unpack helpers (onecomp_runtime/layers/fused_int4_linear.py,
+**The int4 kernels and unpack helpers (onecomp_runtime/layers/fused_int4_linear.py,
 onecomp_runtime/quant_utils.py) are derived from the OneCompression project,
-copyright 2025-2026 Fujitsu Ltd., MIT License.
+copyright 2025-2026 Fujitsu Ltd., MIT License.**
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
