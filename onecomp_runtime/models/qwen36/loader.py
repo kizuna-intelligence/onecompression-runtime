@@ -37,6 +37,7 @@ import torch
 from safetensors.torch import load_file
 
 from ...layers.gemlite_int4_linear import GemLiteInt4Linear, gemlite_available
+from ...layers.packed_gptq_linear import PackedGPTQLinear
 from ...quant_utils import dequant_gptq_to_fp
 
 
@@ -108,11 +109,19 @@ def load_int4_qwen36(
         raise ValueError(f"{cfg_path} has no quantization_config")
     v1 = quant_config.get("checkpoint_format", "gptq") != "gptq_v2"
 
-    use_gemlite = backend in ("auto", "gemlite")
+    if backend not in ("auto", "gemlite", "eager", "packed"):
+        raise ValueError(f"unknown backend {backend!r}")
     if backend == "gemlite" and not gemlite_available():
         raise RuntimeError("backend='gemlite' but gemlite is not importable")
-    if backend == "auto" and not gemlite_available():
-        use_gemlite = False
+    # Resolve to a concrete mode. ``auto`` prefers GemLite (fast, packed) and
+    # falls back to ``packed`` (pure-torch on-the-fly dequant) when GemLite is
+    # unavailable — e.g. on ROCm/AMD — so the model stays at its int4 footprint
+    # instead of the OOM-prone full eager dequant.
+    if backend in ("auto", "gemlite"):
+        mode = "gemlite" if gemlite_available() else "packed"
+    else:
+        mode = backend
+    use_gemlite = mode == "gemlite"
 
     # Build the bare standalone CausalLM on meta (no full bf16 alloc).
     clean = {k: v for k, v in cfg_dict.items() if k != "quantization_config"}
@@ -127,7 +136,7 @@ def load_int4_qwen36(
 
     modules = dict(model.named_modules())
     quant_keys: set[str] = set()
-    gemlite_n = eager_n = 0
+    gemlite_n = eager_n = packed_n = 0
     t0 = time.perf_counter()
     for name, wbits, gs in _iter_quant_layers(quant_config):
         parent_name, _, child = name.rpartition(".")
@@ -143,13 +152,24 @@ def load_int4_qwen36(
                 st[s] = state_dict[k]
                 quant_keys.add(k)
         quant_keys.add(f"{name}.weight")
-        if use_gemlite:
+        if mode == "gemlite":
             layer = GemLiteInt4Linear(
                 in_features=in_f, out_features=out_f,
                 qweight=st["qweight"], scales=st["scales"], qzeros=st["qzeros"],
                 bias=None, groupsize=gs, v1=v1, wbits=wbits, device=dev,
             )
             gemlite_n += 1
+        elif mode == "packed":
+            g_idx = st.get("g_idx")
+            layer = PackedGPTQLinear(
+                in_features=in_f, out_features=out_f,
+                qweight=st["qweight"].to(dev),
+                scales=st["scales"].to(device=dev, dtype=dtype),
+                qzeros=st["qzeros"].to(dev),
+                g_idx=g_idx.to(dev) if g_idx is not None else None,
+                bias=None, groupsize=gs, wbits=wbits, v1=v1,
+            )
+            packed_n += 1
         else:
             layer = _build_eager(st, in_f, out_f, wbits, gs, dtype, dev, v1)
             eager_n += 1
@@ -195,8 +215,8 @@ def load_int4_qwen36(
             raise RuntimeError(f"buffer left on meta device: {n}")
 
     model.eval()
-    print(f"[qwen36_int4] loaded {gemlite_n + eager_n} quant layers "
-          f"(gemlite={gemlite_n}, eager={eager_n}) in "
+    print(f"[qwen36_int4] loaded {gemlite_n + eager_n + packed_n} quant layers "
+          f"(gemlite={gemlite_n}, packed={packed_n}, eager={eager_n}) in "
           f"{time.perf_counter() - t0:.1f}s on {dev}")
 
     if warmup and use_gemlite and dev.type == "cuda":

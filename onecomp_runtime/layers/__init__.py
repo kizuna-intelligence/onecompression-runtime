@@ -25,6 +25,7 @@ from .packed_conv import (
     replace_conv_with_packed,
 )
 from .packed_linear import PackedEmbedding, PackedRTNLinear
+from .packed_gptq_linear import PackedGPTQLinear
 from .dsv4_packed_linear import Dsv4PackedLinear, dequant_dsv4_packed
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "fused_int4_gemm",
     "GemLiteInt4Linear",
     "gemlite_available",
+    "PackedGPTQLinear",
     "PackedRTNLinear",
     "PackedEmbedding",
     "Dsv4PackedLinear",
