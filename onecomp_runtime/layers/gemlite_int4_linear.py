@@ -43,6 +43,7 @@ class GemLiteInt4Linear(nn.Module):
         bias: torch.Tensor | None = None,
         groupsize: int = 32,
         v1: bool = True,
+        wbits: int = 4,
         device: torch.device | str = "cuda:0",
     ):
         super().__init__()
@@ -50,21 +51,22 @@ class GemLiteInt4Linear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
+        self.wbits = wbits
         dev = torch.device(device)
         self._device = dev
 
         # (out, in) uint8 int weights, (out, num_groups) scales / zeros.
         weight_int = unpack_int_weights(
-            qweight.to(dev), 4, (out_features, in_features)
+            qweight.to(dev), wbits, (out_features, in_features)
         ).to(torch.uint8)
-        zeros = unpack_zeros(qzeros.to(dev), 4, out_features)
+        zeros = unpack_zeros(qzeros.to(dev), wbits, out_features)
         if v1:
-            zeros = (zeros + 1) & 0xF
+            zeros = (zeros + 1) & ((1 << wbits) - 1)
         scales_t = scales.to(device=dev, dtype=torch.float16).t().contiguous()
         zeros_t = zeros.to(dtype=torch.float16).t().contiguous()
 
         gl = GemLiteLinearTriton(
-            W_nbits=4,
+            W_nbits=wbits,
             group_size=groupsize,
             in_features=in_features,
             out_features=out_features,

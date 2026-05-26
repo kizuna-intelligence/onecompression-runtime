@@ -9,34 +9,42 @@ from __future__ import annotations
 import torch
 
 
-def _unpack_rows_int4(packed: torch.Tensor, num_rows: int) -> torch.Tensor:
-    """Unpack INT32-packed 4-bit values along dim-0 back to int values."""
+def _unpack_rows(packed: torch.Tensor, num_rows: int, wbits: int) -> torch.Tensor:
+    """Unpack INT32-packed ``wbits`` values along dim-0 back to int values.
+
+    Supports the AutoGPTQ-v1 layouts OneCompression emits: ``wbits`` evenly
+    divides 32 (4-bit -> 8 per int32, 8-bit -> 4 per int32).
+    """
+    if 32 % wbits != 0:
+        raise ValueError(f"wbits must divide 32, got {wbits}")
     packed_rows, cols = packed.shape
-    pack_factor = 8  # 32 // 4
+    pack_factor = 32 // wbits
+    mask = (1 << wbits) - 1
     unpacked = torch.zeros(
         packed_rows, pack_factor, cols, dtype=torch.int32, device=packed.device
     )
     for i in range(pack_factor):
-        unpacked[:, i, :] = (packed >> (i * 4)) & 0x0F
+        unpacked[:, i, :] = (packed >> (i * wbits)) & mask
     return unpacked.reshape(packed_rows * pack_factor, cols)[:num_rows]
+
+
+def _unpack_rows_int4(packed: torch.Tensor, num_rows: int) -> torch.Tensor:
+    """Unpack INT32-packed 4-bit values along dim-0 back to int values."""
+    return _unpack_rows(packed, num_rows, 4)
 
 
 def unpack_int_weights(
     packed: torch.Tensor, wbits: int, original_shape: tuple[int, int]
 ) -> torch.Tensor:
-    """Unpack AutoGPTQ-format packed weights, 4-bit only."""
-    if wbits != 4:
-        raise ValueError(f"only wbits=4 supported, got {wbits}")
+    """Unpack AutoGPTQ-format packed weights (4- or 8-bit)."""
     in_features = original_shape[1]
-    unpacked = _unpack_rows_int4(packed, in_features)
+    unpacked = _unpack_rows(packed, in_features, wbits)
     return unpacked.t().contiguous()
 
 
 def unpack_zeros(packed_zeros: torch.Tensor, wbits: int, out_features: int) -> torch.Tensor:
-    """Unpack AutoGPTQ-format packed zero points, 4-bit only."""
-    if wbits != 4:
-        raise ValueError(f"only wbits=4 supported, got {wbits}")
-    return _unpack_rows_int4(packed_zeros.t().contiguous(), out_features).t().contiguous()
+    """Unpack AutoGPTQ-format packed zero points (4- or 8-bit)."""
+    return _unpack_rows(packed_zeros.t().contiguous(), out_features, wbits).t().contiguous()
 
 
 def dequant_gptq_to_fp(
@@ -48,12 +56,13 @@ def dequant_gptq_to_fp(
     out_features: int,
     dtype: torch.dtype,
     v1: bool = True,
+    wbits: int = 4,
 ) -> torch.Tensor:
-    """Dequantize an AutoGPTQ-v1 packed 4-bit Linear back to (out, in) `dtype`."""
-    weight_int = unpack_int_weights(qweight, 4, (out_features, in_features))
-    zeros = unpack_zeros(qzeros, 4, out_features)
+    """Dequantize an AutoGPTQ-v1 packed 4- or 8-bit Linear to (out, in) `dtype`."""
+    weight_int = unpack_int_weights(qweight, wbits, (out_features, in_features))
+    zeros = unpack_zeros(qzeros, wbits, out_features)
     if v1:
-        zeros = (zeros + 1) & 0x0F
+        zeros = (zeros + 1) & ((1 << wbits) - 1)
     scale_expanded = scales[g_idx, :].T
     zero_expanded = zeros[g_idx, :].T
     weight = scale_expanded.float() * (weight_int.float() - zero_expanded.float())
