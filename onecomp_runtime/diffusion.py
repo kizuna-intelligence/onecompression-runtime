@@ -63,6 +63,9 @@ def load_int4_model(
     backend: str | None = "auto",
     use_fused: bool = True,
     post_load: Callable[[torch.nn.Module], None] | None = None,
+    prepare_meta_model: Callable[[torch.nn.Module], None] | None = None,
+    quant_layer_filter: Callable[[str], bool] | None = None,
+    tensor_filter: Callable[[str], bool] | None = None,
     warmup: bool = True,
     warmup_m_values: tuple[int, ...] = (64, 128, 256, 1024, 4096),
     label: str = "onecomp_runtime",
@@ -84,6 +87,10 @@ def load_int4_model(
         use_fused: legacy switch; ``False`` forces the eager-dequant fallback.
         post_load: optional ``(model) -> None`` hook run after weights are
             loaded — for per-model buffer fixups (rope tables, etc.).
+        prepare_meta_model: optional hook that prunes or adjusts the meta model
+            before tensors are materialised.
+        quant_layer_filter: optional predicate selecting packed Linear layers.
+        tensor_filter: optional predicate selecting non-quantized tensors.
         warmup: trigger Triton JIT for the M-buckets inference will hit.
         warmup_m_values: token counts to pre-compile (batch * seq).
         label: prefix used in the load-summary print line.
@@ -116,6 +123,8 @@ def load_int4_model(
         # for 14B video transformers.
         with torch.device("meta"):
             model = build_meta_model(cfg)
+        if prepare_meta_model is not None:
+            prepare_meta_model(model)
 
         modules = dict(model.named_modules())
         counts = {
@@ -131,9 +140,20 @@ def load_int4_model(
         }
         quant_keys: set[str] = set()
         quant_names: list[str] = []
+        # Exclude every packed tensor from the non-quantized loading pass,
+        # including layers deliberately pruned by quant_layer_filter.
+        for entry in quant_layers:
+            name = entry["name"]
+            quant_keys.add(f"{name}.weight")
+            for suffix in ("qweight", "scales", "qzeros", "g_idx", "bias"):
+                key = f"{name}.{suffix}"
+                if key in tensor_keys:
+                    quant_keys.add(key)
         for entry in quant_layers:
             entry["checkpoint_format"] = ckpt_fmt
             name = entry["name"]
+            if quant_layer_filter is not None and not quant_layer_filter(name):
+                continue
             quant_names.append(name)
             parent_name, _, child = name.rpartition(".")
             parent = modules.get(parent_name) if parent_name else model
@@ -144,8 +164,6 @@ def load_int4_model(
                 k = f"{name}.{s}"
                 if k in tensor_keys:
                     st[s] = f.get_tensor(k)
-                    quant_keys.add(k)
-            quant_keys.add(f"{name}.weight")
             layer, kind = build_quant_layer(entry, st, backend, resolved, dev)
             counts[kind] += 1
             setattr(parent, child, layer)
@@ -157,6 +175,8 @@ def load_int4_model(
         non_quant = {}
         for k in tensor_keys:
             if k in quant_keys:
+                continue
+            if tensor_filter is not None and not tensor_filter(k):
                 continue
             tensor = f.get_tensor(k)
             non_quant[k] = tensor.to(
@@ -185,7 +205,7 @@ def load_int4_model(
         raise RuntimeError(f"parameter left on meta device: {leftover[:8]} ...")
 
     model.eval()
-    print(f"[{label}] loaded {len(quant_layers)} int4 layers "
+    print(f"[{label}] loaded {len(quant_names)} int4 layers "
           f"(gemlite={counts['gemlite']}, a8w4={counts['a8w4']}, "
           f"a8w4_ffn_up={counts['a8w4_ffn_up']}, "
           f"mxfp4_ffn={counts['mxfp4_ffn']}, "

@@ -99,6 +99,10 @@ use the padded-groups fused kernel, and multicontrol branches whose resolved
 control weight is zero are zeroed before the official forward so Cosmos skips
 their control blocks.
 
+Cosmos Predict2.5 helpers in `models/cosmos_predict25` use the same
+official-pipeline split: build the official Predict inference stack first, then
+replace packed int4 layers inside `model.net`.
+
 ## Checkpoint contract
 
 A single `safetensors` with metadata keys `config_json`, `quant_layers_json`
