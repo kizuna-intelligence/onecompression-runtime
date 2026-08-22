@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import Counter
 from typing import Any
 
 import torch
@@ -59,6 +60,36 @@ def _iter_quant_layers(quant_config: dict):
             yield f"model.layers.{layer_idx}.{suffix}", int(bits), gs
 
 
+def _normalize_text_decoder_keys(
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], int]:
+    """Map VLM-wrapped text-decoder keys to standalone CausalLM keys.
+
+    Qwen3.5 conditional-generation checkpoints store the decoder below
+    ``model.language_model``.  Quantization may subsequently save a text-only
+    config while retaining that state-dict prefix.  The standalone CausalLM
+    built by this loader expects the same tensors below ``model``.
+    """
+    source_prefix = "model.language_model."
+    target_prefix = "model."
+    if not any(key.startswith(source_prefix) for key in state_dict):
+        return state_dict, 0
+
+    normalized: dict[str, torch.Tensor] = {}
+    renamed = 0
+    for key, tensor in state_dict.items():
+        target = (
+            target_prefix + key[len(source_prefix):]
+            if key.startswith(source_prefix)
+            else key
+        )
+        if target in normalized:
+            raise ValueError(f"state-dict key collision while normalizing {key!r}")
+        normalized[target] = tensor
+        renamed += target != key
+    return normalized, renamed
+
+
 def _build_eager(st: dict, in_f: int, out_f: int, wbits: int, gs: int,
                  dtype: torch.dtype, dev: torch.device, v1: bool) -> torch.nn.Linear:
     g_idx = st.get("g_idx")
@@ -82,6 +113,7 @@ def load_int4_qwen36(
     backend: str = "auto",
     warmup: bool = False,
     warmup_m_values: tuple[int, ...] = (1, 8, 64, 256),
+    attn_implementation: str | None = None,
 ):
     """Rebuild a packed-int4 ``Qwen3_5ForCausalLM`` for fast decode.
 
@@ -94,6 +126,9 @@ def load_int4_qwen36(
             the dequant-to-bf16 fallback (for A/B speed comparison).
         warmup: pre-compile GemLite kernels for the given token counts.
         warmup_m_values: M-buckets to warm up (decode hits small M).
+        attn_implementation: Transformers attention implementation. ``None`` keeps
+            the checkpoint/config default; ``"sdpa"`` uses PyTorch's fused SDPA
+            path for Qwen's full-attention layers.
 
     Returns:
         ``(model, tokenizer)`` — model in ``eval`` mode on ``device``.
@@ -129,10 +164,19 @@ def load_int4_qwen36(
     if not model_type or model_type not in CONFIG_MAPPING:
         raise ValueError(f"model_type={model_type!r} not in CONFIG_MAPPING")
     model_config = CONFIG_MAPPING[model_type].from_dict(clean)
+    if attn_implementation:
+        # ``from_config`` does not reliably override this private field across
+        # Transformers releases. Set it on the concrete config before building
+        # the model so Qwen3_5Attention reads the requested implementation.
+        model_config._attn_implementation = attn_implementation
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(model_config, dtype=dtype)
 
     state_dict = load_file(os.path.join(checkpoint_dir, "model.safetensors"))
+    state_dict, normalized_n = _normalize_text_decoder_keys(state_dict)
+    if normalized_n:
+        print(f"[qwen36_int4] normalized {normalized_n} "
+              "model.language_model.* checkpoint keys")
 
     modules = dict(model.named_modules())
     quant_keys: set[str] = set()
@@ -215,9 +259,39 @@ def load_int4_qwen36(
             raise RuntimeError(f"buffer left on meta device: {n}")
 
     model.eval()
+    parameter_devices = Counter(str(p.device) for p in model.parameters())
+    parameter_dtypes = Counter(str(p.dtype) for p in model.parameters())
+    buffer_devices = Counter(str(b.device) for b in model.buffers())
+    buffer_dtypes = Counter(str(b.dtype) for b in model.buffers())
+    quant_module_counts = Counter(
+        type(module).__name__
+        for module in model.modules()
+        if type(module).__name__ in {
+            "GemLiteInt4Linear", "PackedGPTQLinear", "Linear",
+        }
+    )
+    quant_bits = Counter(
+        str(getattr(module, "wbits"))
+        for module in model.modules()
+        if type(module).__name__ == "GemLiteInt4Linear"
+    )
+    runtime_summary = {
+        "device": str(dev),
+        "attn_implementation": getattr(model.config, "_attn_implementation", None),
+        "quant_backend": mode,
+        "quant_module_counts": dict(quant_module_counts),
+        "gemlite_wbits": dict(quant_bits),
+        "parameter_devices": dict(parameter_devices),
+        "parameter_dtypes": dict(parameter_dtypes),
+        "buffer_devices": dict(buffer_devices),
+        "buffer_dtypes": dict(buffer_dtypes),
+        "hf_device_map_present": hasattr(model, "hf_device_map"),
+    }
+    model._onecomp_runtime_summary = runtime_summary
     print(f"[qwen36_int4] loaded {gemlite_n + eager_n + packed_n} quant layers "
           f"(gemlite={gemlite_n}, packed={packed_n}, eager={eager_n}) in "
           f"{time.perf_counter() - t0:.1f}s on {dev}")
+    print("[qwen36_runtime] " + json.dumps(runtime_summary, sort_keys=True))
 
     if warmup and use_gemlite and dev.type == "cuda":
         seen: dict[tuple, Any] = {}
