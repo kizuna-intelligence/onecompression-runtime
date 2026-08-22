@@ -2,6 +2,10 @@
 
 - :class:`FusedInt4Linear` / :func:`fused_int4_gemm` — Triton dequant+GEMM for
   AutoGPTQ-v1 packed int4 weights (groupsize 32, fp16/bf16/fp32 in, fp16 out).
+- :class:`FusedInt4LinearAnyGroup` — generic Triton dequant+GEMM for odd
+  groupsizes that do not fit the optimized groupsize-32 kernel.
+- :class:`FusedInt4LinearPaddedGroups` — re-layout odd groups onto the
+  optimized groupsize-32 kernel without re-quantizing.
 - :class:`GemLiteInt4Linear` / :func:`gemlite_available` — GemLite kernel wrapper
   (fp16 I/O) for the same packed format.
 - :class:`PackedRTNLinear` / :class:`PackedEmbedding` — RTN uint8-nibble layers
@@ -15,7 +19,12 @@ Copyright 2025-2026 Kizuna Intelligence / Fujitsu Ltd. MIT License.
 """
 from __future__ import annotations
 
-from .fused_int4_linear import FusedInt4Linear, fused_int4_gemm
+from .fused_int4_linear import (
+    FusedInt4Linear,
+    FusedInt4LinearAnyGroup,
+    FusedInt4LinearPaddedGroups,
+    fused_int4_gemm,
+)
 from .gemlite_int4_linear import GemLiteInt4Linear, gemlite_available
 from .packed_conv import (
     PackedInt4Conv1d,
@@ -30,6 +39,8 @@ from .dsv4_packed_linear import Dsv4PackedLinear, dequant_dsv4_packed
 
 __all__ = [
     "FusedInt4Linear",
+    "FusedInt4LinearAnyGroup",
+    "FusedInt4LinearPaddedGroups",
     "fused_int4_gemm",
     "GemLiteInt4Linear",
     "gemlite_available",

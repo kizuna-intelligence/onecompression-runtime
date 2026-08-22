@@ -23,6 +23,7 @@ pip install onecomp-runtime[diffusion]   # + diffusers (generic loader builds di
 | FireRed-Image-Edit | image edit | 20B Qwen-Image | int4 GPTQ (QEP) | `models/firered` | `kizuna-intelligence/FireRed-Image-Edit-int4` |
 | DeepSeek-V4-Flash | text MoE 284B | mHC/CSA + 256-expert | int4 dense + int2 experts (QEP) | `models/dsv4` | `kizuna-intelligence/DeepSeek-V4-Flash-int4-qep` |
 | Qwen3.6-27B | text LLM | Qwen3_5 GatedDeltaNet/attn hybrid | int4/int8 GPTQ (QEP) | `models/qwen36` | — |
+| Wan2.1-VACE-14B | video edit | Wan VACE 3D DiT | int4 GPTQ (QEP main) + RTN VACE | `models/wan_vace` | — |
 
 QEP = Fujitsu Quantization Error Propagation. New models plug in via a
 `build_meta_model` + `post_load` adapter; experimental backbones land here once
@@ -68,17 +69,35 @@ The only per-model code is `build_meta_model` (construct the bare module from th
 checkpoint's `config_json`) and an optional `post_load(model)` hook for buffer
 fixups (e.g. FireRed/Qwen-Image RoPE tables that meta-init leaves uninitialised).
 
+Wan2.1 VACE runtime support lives in `models/wan_vace`. The generation
+orchestration and experiment notes are kept in
+`~/gitrepos/ad-data-pipeline/scripts/wan_vace_generate.py` and
+`~/gitrepos/ad-data-pipeline/docs/wan_vace_experiments.md`.
+
 ## Backends
 
 | backend | kernel | I/O dtype | when |
 |---|---|---|---|
 | `gemlite` | GemLite Triton int4 | fp16 only | large M (FLUX), if installed |
-| `fused` | bundled Triton dequant+GEMM | fp16/bf16/fp32 | default; bf16-safe |
-| `eager` | dequant once to `nn.Linear` | any | groupsize≠32, actorder, odd shapes |
+| `a8w4` | GemLite dynamic 8-bit activation + GPTQ W4 | fp16 internal | experimental quality check |
+| `a8w4_ffn_up` | `a8w4` only for FFN up-projection | fp16 internal | experimental layer ablation |
+| `mxfp4_ffn` | GemLite MXFP4/MXFP8 only for FFN layers | fp16 internal | experimental speed/quality ablation |
+| `mxfp4_ffn_up` | GemLite MXFP4/MXFP8 only for FFN up-projection | fp16 internal | experimental speed/quality ablation |
+| `nvfp4_ffn` | GemLite NVFP4 only for FFN Linear layers | fp16 internal | experimental layer ablation |
+| `fused` | bundled Triton dequant+GEMM | fp16/bf16/fp32 | default; bf16-safe; includes padded-groups path for some odd groupsizes |
+| `packed` | packed GPTQ + per-call dequant | fp16/bf16/fp32 | fallback for unsupported fused shapes |
+| `eager` | dequant once to `nn.Linear` | any | A/B checks or unsupported packed formats |
 
 `backend="auto"` → gemlite if importable, else fused. **bf16 is the safe default**
 for Qwen-Image / LTX (fp16 overflows to NaN); fp16 is only required on the
-GemLite path.
+GemLite path. `a8w4`, `a8w4_ffn_up`, `mxfp4_ffn`, `mxfp4_ffn_up`, and
+`nvfp4_ffn` are explicit experimental backends and are never selected by `auto`.
+
+Cosmos Transfer2.5 helpers in `models/cosmos_transfer25` add runtime-only
+optimizations on top of layer replacement: odd `groupsize=26` control embedders
+use the padded-groups fused kernel, and multicontrol branches whose resolved
+control weight is zero are zeroed before the official forward so Cosmos skips
+their control blocks.
 
 ## Checkpoint contract
 

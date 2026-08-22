@@ -51,7 +51,9 @@ class PackedGPTQLinear(nn.Module):
         self.wbits = int(wbits)
         self.v1 = bool(v1)
         if g_idx is None:
-            g_idx = (torch.arange(in_features) // groupsize).to(torch.long)
+            g_idx = (
+                torch.arange(in_features, device=qweight.device) // groupsize
+            ).to(torch.long)
         self.register_buffer("qweight", qweight.contiguous())
         self.register_buffer("scales", scales.contiguous())
         self.register_buffer("qzeros", qzeros.contiguous())

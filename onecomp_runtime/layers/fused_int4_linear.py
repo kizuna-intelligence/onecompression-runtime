@@ -23,9 +23,105 @@ These cover 100% of the moespeech_ft_5000 quantized-DiT layers.
 """
 from __future__ import annotations
 
+import atexit
+import os
+import time
+
 import torch
 import triton
 import triton.language as tl
+
+from ..quant_utils import unpack_int_weights
+
+_PROFILE_PADDED_GROUPS = os.environ.get("ONECOMP_PROFILE_PADDED_GROUPS") == "1"
+_PROFILE_SHAPES = os.environ.get("ONECOMP_PROFILE_SHAPES") == "1"
+_PADDED_GROUPS_STATS: dict[str, float] = {"calls": 0.0, "seconds": 0.0}
+_SHAPE_STATS: dict[tuple[str, int, int, int], int] = {}
+
+
+def _print_padded_groups_stats() -> None:
+    if not _PROFILE_PADDED_GROUPS:
+        return
+    calls = int(_PADDED_GROUPS_STATS["calls"])
+    seconds = _PADDED_GROUPS_STATS["seconds"]
+    if calls:
+        print(
+            f"[onecomp-profile] FusedInt4LinearPaddedGroups calls={calls} "
+            f"total={seconds:.6f}s avg={seconds / calls * 1000:.3f}ms",
+            flush=True,
+        )
+
+
+atexit.register(_print_padded_groups_stats)
+
+
+def _print_shape_stats() -> None:
+    if not _PROFILE_SHAPES:
+        return
+    if not _SHAPE_STATS:
+        return
+    print("[onecomp-profile] fused shape calls:", flush=True)
+    for (kind, m, k, n), count in sorted(
+        _SHAPE_STATS.items(), key=lambda item: item[1], reverse=True
+    )[:40]:
+        print(
+            f"[onecomp-profile] {kind:14s} M={m:<5d} K={k:<5d} N={n:<5d} calls={count}",
+            flush=True,
+        )
+
+
+atexit.register(_print_shape_stats)
+
+
+def _pack_int4_weights(weight_int: torch.Tensor) -> torch.Tensor:
+    """Pack integer weights from [out, in] to GPTQ qweight [in//8, out]."""
+    if weight_int.dtype != torch.int32:
+        weight_int = weight_int.to(torch.int32)
+    out_features, in_features = weight_int.shape
+    if in_features % 8 != 0:
+        raise ValueError(f"in_features must be divisible by 8, got {in_features}")
+    rows = weight_int.t().contiguous()
+    packed = torch.zeros(
+        (in_features // 8, out_features),
+        dtype=torch.int32,
+        device=weight_int.device,
+    )
+    for i in range(8):
+        packed |= (rows[i::8] & 0xF) << (i * 4)
+    return packed
+
+
+def _repack_groups_to_32(
+    qweight: torch.Tensor,
+    *,
+    in_features: int,
+    out_features: int,
+    groupsize: int,
+) -> tuple[torch.Tensor, int]:
+    """Re-layout odd-size GPTQ groups as 32-wide groups without re-quantizing.
+
+    Original rows in each quant group keep their exact int4 code. The added rows
+    are zeros in both activation and packed weight, so they do not change output.
+    """
+    if groupsize <= 0 or groupsize > 32:
+        raise ValueError(f"groupsize must be in 1..32, got {groupsize}")
+    if in_features % groupsize != 0:
+        raise ValueError(
+            f"in_features={in_features} must be divisible by groupsize={groupsize}"
+        )
+    num_groups = in_features // groupsize
+    padded_in_features = num_groups * 32
+    weight_int = unpack_int_weights(qweight, 4, (out_features, in_features))
+    padded = torch.zeros(
+        (out_features, padded_in_features),
+        dtype=torch.int32,
+        device=weight_int.device,
+    )
+    for group in range(num_groups):
+        src = slice(group * groupsize, (group + 1) * groupsize)
+        dst = slice(group * 32, group * 32 + groupsize)
+        padded[:, dst].copy_(weight_int[:, src])
+    return _pack_int4_weights(padded), padded_in_features
 
 
 @triton.jit
@@ -176,6 +272,119 @@ def _fused_int4_gemm_kernel(
     tl.store(c_ptrs, c_tile, mask=(offs_m[:, None] < M) & n_mask[None, :])
 
 
+@triton.jit
+def _fused_int4_gemm_padded_groups_kernel(
+    a_ptr,
+    qw_ptr,
+    s_ptr,
+    qz_ptr,
+    bias_ptr,
+    c_ptr,
+    M,
+    N: tl.constexpr,
+    K_PADDED: tl.constexpr,
+    K_LOGICAL: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_qwk,
+    stride_qwn,
+    stride_sg,
+    stride_sn,
+    stride_qzg,
+    stride_qzn,
+    stride_cm,
+    stride_cn,
+    HAS_BIAS: tl.constexpr,
+    ORIG_GROUPSIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_K_GROUPS: tl.constexpr,
+):
+    """Fused GEMM for odd GPTQ groups re-laid out as 32-wide packed groups.
+
+    qweight/scales/qzeros are stored as if every original group had 32 K rows:
+    first ORIG_GROUPSIZE rows are real and the rest are zero rows. The activation
+    remains compact [M, K_LOGICAL]; this kernel maps padded K rows back to the
+    compact activation coordinates and injects zeros for padded rows.
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    PAD_GROUPSIZE: tl.constexpr = 32
+    K_BLK: tl.constexpr = NUM_K_GROUPS * PAD_GROUPSIZE
+    N_WORDS: tl.constexpr = NUM_K_GROUPS * 4
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+
+    k_in_blk = tl.arange(0, K_BLK)
+    bit_off = (k_in_blk % 8) * 4
+    group_in_blk = k_in_blk // PAD_GROUPSIZE
+    within_group = k_in_blk % PAD_GROUPSIZE
+
+    qz_word_n = offs_n // 8
+    qz_bit_n = (offs_n % 8) * 4
+
+    a_row_ptrs = a_ptr + offs_m[:, None] * stride_am
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    g_arr = tl.arange(0, NUM_K_GROUPS)
+    word_arr = tl.arange(0, N_WORDS)
+
+    num_outer: tl.constexpr = (K_PADDED + K_BLK - 1) // K_BLK
+    for outer in range(num_outer):
+        g_base = outer * NUM_K_GROUPS
+
+        s_2d = tl.load(
+            s_ptr + (g_base + g_arr)[:, None] * stride_sg + offs_n[None, :] * stride_sn,
+            mask=n_mask[None, :],
+            other=0.0,
+        )
+        qz_packed = tl.load(
+            qz_ptr + (g_base + g_arr)[:, None] * stride_qzg + qz_word_n[None, :] * stride_qzn,
+            mask=n_mask[None, :],
+            other=0,
+        )
+        qz_raw = (qz_packed >> qz_bit_n[None, :]) & 0xF
+        qz_2d = (qz_raw + 1) & 0xF
+
+        wp_base = g_base * 4
+        w_words = tl.load(
+            qw_ptr + (wp_base + word_arr)[:, None] * stride_qwk + offs_n[None, :] * stride_qwn,
+            mask=n_mask[None, :],
+            other=0,
+        )
+        w_rep = tl.broadcast_to(w_words[:, None, :], (N_WORDS, 8, BLOCK_N))
+        w_packed_per_k = tl.reshape(w_rep, (K_BLK, BLOCK_N))
+        w_int = (w_packed_per_k >> bit_off[:, None]) & 0xF
+
+        s_rep = tl.broadcast_to(s_2d[:, None, :], (NUM_K_GROUPS, PAD_GROUPSIZE, BLOCK_N))
+        s_full = tl.reshape(s_rep, (K_BLK, BLOCK_N))
+        qz_rep = tl.broadcast_to(qz_2d[:, None, :], (NUM_K_GROUPS, PAD_GROUPSIZE, BLOCK_N))
+        qz_full = tl.reshape(qz_rep, (K_BLK, BLOCK_N))
+        w_fp_h = (w_int.to(s_full.dtype) - qz_full.to(s_full.dtype)) * s_full
+
+        src_k = (g_base + group_in_blk) * ORIG_GROUPSIZE + within_group
+        real_k = (within_group < ORIG_GROUPSIZE) & (src_k < K_LOGICAL)
+        a_tile = tl.load(
+            a_row_ptrs + src_k[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & real_k[None, :],
+            other=0.0,
+        )
+        accumulator = tl.dot(a_tile, w_fp_h.to(a_tile.dtype), acc=accumulator)
+
+    if HAS_BIAS:
+        b = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+        accumulator += b[None, :].to(tl.float32)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_tile = accumulator.to(c_ptrs.dtype.element_ty)
+    tl.store(c_ptrs, c_tile, mask=(offs_m[:, None] < M) & n_mask[None, :])
+
+
 def fused_int4_gemm(
     a: torch.Tensor,
     qweight: torch.Tensor,
@@ -253,7 +462,19 @@ def fused_int4_gemm(
     elif M <= 256:
         BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 32, 4, 3
     elif M <= 1024:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+        if N >= 2048 and K == 1024:
+            # Cosmos control path hits M=512 K=1024 N=2048 frequently. Sweep on
+            # RTX 3090 prefers 64x64 with K_BLK=64 (NUM_K_GROUPS=2) and ns=3.
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 3
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+    elif N >= 2048 and K >= 2048:
+        # Full 704x704 Cosmos path reaches large-M DiT shapes such as
+        # M=21600 with K/N in {2048, 8192}. A sweep on RTX 3090 showed 128x128
+        # tiles with one 32-wide K group beat the older 64x64 large-M default
+        # by ~16-20% and match or beat bf16 cuBLAS on the common square shape.
+        BLOCK_M, BLOCK_N, num_warps = 128, 128, 4
+        num_stages = 3
     elif N >= 2048 and K <= 1536:
         # (M=2250, K=1280, N=3680)-style: fat M-tile clears the win.
         BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 2
@@ -314,6 +535,424 @@ def fused_int4_gemm(
     if orig_dtype == torch.float32:
         out = out.to(torch.float32)
     return out
+
+
+@triton.jit
+def _fused_int4_gemm_any_gs_kernel(
+    a_ptr,
+    qw_ptr,
+    s_ptr,
+    qz_ptr,
+    bias_ptr,
+    c_ptr,
+    M,
+    N: tl.constexpr,
+    K_LOGICAL: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_qwk,
+    stride_qwn,
+    stride_sg,
+    stride_sn,
+    stride_qzg,
+    stride_qzn,
+    stride_cm,
+    stride_cn,
+    HAS_BIAS: tl.constexpr,
+    GROUPSIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Generic GPTQ-v1 int4 fused kernel for non-32 groups.
+
+    It loads packed weight words by absolute K row (``k // 8``) rather than
+    assuming each quant group spans exactly four int32 words. That makes it
+    correct for layouts such as K=520, groupsize=26. It is intentionally simpler
+    than the groupsize=32 production kernel; use it for the few odd-shaped
+    layers that would otherwise need eager dequant.
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k_base = tl.arange(0, BLOCK_K)
+    n_mask = offs_n < N
+
+    qz_word_n = offs_n // 8
+    qz_bit_n = (offs_n % 8) * 4
+
+    a_row_ptrs = a_ptr + offs_m[:, None] * stride_am
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    num_outer: tl.constexpr = (K_LOGICAL + BLOCK_K - 1) // BLOCK_K
+    for outer in range(num_outer):
+        offs_k = outer * BLOCK_K + offs_k_base
+        k_mask = offs_k < K_LOGICAL
+        group_idx = offs_k // GROUPSIZE
+
+        w_word_k = offs_k // 8
+        w_bit_k = (offs_k % 8) * 4
+        w_packed = tl.load(
+            qw_ptr + w_word_k[:, None] * stride_qwk + offs_n[None, :] * stride_qwn,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0,
+        )
+        w_int = (w_packed >> w_bit_k[:, None]) & 0xF
+
+        scales = tl.load(
+            s_ptr + group_idx[:, None] * stride_sg + offs_n[None, :] * stride_sn,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        )
+        qz_packed = tl.load(
+            qz_ptr + group_idx[:, None] * stride_qzg + qz_word_n[None, :] * stride_qzn,
+            mask=k_mask[:, None] & n_mask[None, :],
+            other=0,
+        )
+        qz_raw = (qz_packed >> qz_bit_n[None, :]) & 0xF
+        qz = (qz_raw + 1) & 0xF
+        w_fp = (w_int.to(scales.dtype) - qz.to(scales.dtype)) * scales
+
+        a_tile = tl.load(
+            a_row_ptrs + offs_k[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        accumulator = tl.dot(a_tile, w_fp.to(a_tile.dtype), acc=accumulator)
+
+    if HAS_BIAS:
+        b = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+        accumulator += b[None, :].to(tl.float32)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        accumulator.to(c_ptrs.dtype.element_ty),
+        mask=(offs_m[:, None] < M) & n_mask[None, :],
+    )
+
+
+class FusedInt4LinearAnyGroup(torch.nn.Module):
+    """Fused int4 GEMM for GPTQ-v1 layers with odd groupsizes.
+
+    This is a correctness-first fast path for the small number of layers that
+    cannot use :class:`FusedInt4Linear`'s groupsize=32 optimized kernel.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        groupsize: int = 32,
+    ):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.groupsize = int(groupsize)
+        self.register_buffer("qweight", qweight.contiguous())
+        self.register_buffer("scales", scales.contiguous())
+        self.register_buffer("qzeros", qzeros.contiguous())
+        if bias is not None:
+            self.register_buffer("bias", bias.contiguous())
+            self._has_bias = True
+        else:
+            self.bias = None
+            self._has_bias = False
+        self._empty_bias: torch.Tensor | None = None
+        self._cfg_cache: dict[int, tuple] = {}
+
+    def _build_cfg(self, M: int) -> tuple:
+        N = self.out_features
+        if M <= 128:
+            BLOCK_M, BLOCK_N = 32, 32
+        elif M <= 512:
+            BLOCK_M, BLOCK_N = 64, 32
+        else:
+            BLOCK_M, BLOCK_N = 64, 64
+        BLOCK_K = 32
+        grid = ((M + BLOCK_M - 1) // BLOCK_M * ((N + BLOCK_N - 1) // BLOCK_N),)
+        cfg = (BLOCK_M, BLOCK_N, BLOCK_K, grid)
+        self._cfg_cache[M] = cfg
+        return cfg
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        if x.dtype == torch.float32:
+            x = x.to(torch.float16)
+
+        x_dim = x.dim()
+        if x_dim == 2:
+            a_2d = x
+            M = x.shape[0]
+        else:
+            a_2d = x.reshape(-1, self.in_features)
+            M = a_2d.shape[0]
+
+        cfg = self._cfg_cache.get(M)
+        if cfg is None:
+            cfg = self._build_cfg(M)
+        BLOCK_M, BLOCK_N, BLOCK_K, grid = cfg
+
+        if self._has_bias:
+            bias_h = self.bias
+        else:
+            cached = self._empty_bias
+            if cached is None or cached.dtype != x.dtype or cached.device != x.device:
+                cached = torch.empty(0, dtype=x.dtype, device=x.device)
+                self._empty_bias = cached
+            bias_h = cached
+
+        N = self.out_features
+        c = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        _fused_int4_gemm_any_gs_kernel[grid](
+            a_2d, self.qweight, self.scales, self.qzeros, bias_h, c,
+            M, N, self.in_features,
+            a_2d.stride(0), a_2d.stride(1),
+            self.qweight.stride(0), self.qweight.stride(1),
+            self.scales.stride(0), self.scales.stride(1),
+            self.qzeros.stride(0), self.qzeros.stride(1),
+            c.stride(0), c.stride(1),
+            HAS_BIAS=self._has_bias,
+            GROUPSIZE=self.groupsize,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=3,
+        )
+        if orig_dtype == torch.float32:
+            c = c.to(torch.float32)
+        if x_dim == 2:
+            return c
+        return c.reshape(*x.shape[:-1], N)
+
+    @torch.no_grad()
+    def warmup(self, m_values=(32, 128, 256, 1024, 2250)) -> None:
+        device = self.qweight.device
+        dtype = self.scales.dtype if self.scales.dtype in (torch.float16, torch.bfloat16) else torch.float16
+        for m in m_values:
+            if m <= 0:
+                continue
+            x = torch.zeros((int(m), self.in_features), dtype=dtype, device=device)
+            _ = self.forward(x)
+        torch.cuda.synchronize() if device.type == "cuda" else None
+
+    def _apply(self, fn, recurse=True):
+        qweight_before = self.qweight
+        qzeros_before = self.qzeros
+        result = super()._apply(fn, recurse=recurse)
+        if self.qweight.dtype != torch.int32:
+            self.qweight = qweight_before.to(self.qweight.device)
+        if self.qzeros.dtype != torch.int32:
+            self.qzeros = qzeros_before.to(self.qzeros.device)
+        if self.scales.dtype not in (torch.float16, torch.bfloat16):
+            self.scales = self.scales.to(torch.float16)
+        return result
+
+
+class FusedInt4LinearPaddedGroups(torch.nn.Module):
+    """Run odd groupsize GPTQ int4 layers through the optimized groupsize-32 kernel.
+
+    Each original quant group is expanded to 32 K rows at load time by appending
+    zero-code rows. Forward applies the same zero insertion to activations, so
+    the output is equivalent to the original odd-groupsize GPTQ layer while the
+    matmul itself uses :class:`FusedInt4Linear`'s optimized kernel.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        groupsize: int = 32,
+    ):
+        super().__init__()
+        if groupsize == 32:
+            raise ValueError("FusedInt4LinearPaddedGroups is only for odd groupsizes")
+        if groupsize <= 0 or groupsize > 32:
+            raise ValueError(f"groupsize must be in 1..32, got {groupsize}")
+        if in_features % groupsize != 0:
+            raise ValueError(
+                f"in_features={in_features} must be divisible by groupsize={groupsize}"
+            )
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.groupsize = int(groupsize)
+        self.num_groups = self.in_features // self.groupsize
+
+        padded_qweight, padded_in_features = _repack_groups_to_32(
+            qweight,
+            in_features=self.in_features,
+            out_features=self.out_features,
+            groupsize=self.groupsize,
+        )
+        self.padded_in_features = int(padded_in_features)
+        self.register_buffer("qweight", padded_qweight.contiguous())
+        self.register_buffer("scales", scales.contiguous())
+        self.register_buffer("qzeros", qzeros.contiguous())
+        if bias is not None:
+            self.register_buffer("bias", bias.contiguous())
+            self._has_bias = True
+        else:
+            self.bias = None
+            self._has_bias = False
+        self._empty_bias: torch.Tensor | None = None
+        self._cfg_cache: dict[int, tuple] = {}
+
+    def _build_cfg(self, M: int) -> tuple:
+        K = self.padded_in_features
+        N = self.out_features
+        if M <= 32:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 2, 4
+        elif M <= 128:
+            if N >= 2048:
+                BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 2
+            else:
+                BLOCK_M, BLOCK_N, num_warps, num_stages = 32, 32, 4, 3
+        elif M <= 256:
+            if N >= 2048:
+                BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 32, 4, 3
+            else:
+                BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 32, 4, 3
+        elif M <= 1024:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+        elif N >= 2048 and K >= 2048:
+            BLOCK_M, BLOCK_N, num_warps = 128, 128, 4
+            num_stages = 3
+        elif N >= 2048 and K <= 1536:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 2
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+
+        tile_area = BLOCK_M * BLOCK_N
+        if tile_area <= 1024 and K % 256 == 0:
+            NUM_K_GROUPS = 8
+        elif K % 128 == 0:
+            NUM_K_GROUPS = 4
+        elif K % 64 == 0:
+            NUM_K_GROUPS = 2
+        else:
+            NUM_K_GROUPS = 1
+        if 256 < M <= 1024 and N >= 2048 and K == 1024:
+            NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+        elif M > 1024:
+            if N >= 2048 and K <= 1536:
+                NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+            else:
+                NUM_K_GROUPS = 1
+        elif 128 < M <= 256:
+            if N >= 2048:
+                NUM_K_GROUPS = 1
+            else:
+                NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+        elif M <= 128 and N >= 2048:
+            NUM_K_GROUPS = min(NUM_K_GROUPS, 4)
+
+        grid = ((M + BLOCK_M - 1) // BLOCK_M * ((N + BLOCK_N - 1) // BLOCK_N),)
+        cfg = (BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS, grid)
+        self._cfg_cache[M] = cfg
+        return cfg
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        if x.dtype == torch.float32:
+            x = x.to(torch.float16)
+
+        x_dim = x.dim()
+        if x_dim == 2:
+            a_2d = x
+            M = x.shape[0]
+            leading_shape = x.shape[:-1]
+        else:
+            leading_shape = x.shape[:-1]
+            a_2d = x.reshape(-1, self.in_features)
+            M = a_2d.shape[0]
+        if _PROFILE_SHAPES:
+            key = ("padded", int(M), self.in_features, self.out_features)
+            _SHAPE_STATS[key] = _SHAPE_STATS.get(key, 0) + 1
+
+        cfg = self._cfg_cache.get(M)
+        if cfg is None:
+            cfg = self._build_cfg(M)
+        BLOCK_M, BLOCK_N, num_warps, num_stages, NUM_K_GROUPS, grid = cfg
+
+        if self._has_bias:
+            bias_h = self.bias
+        else:
+            cached = self._empty_bias
+            if cached is None or cached.dtype != x.dtype or cached.device != x.device:
+                cached = torch.empty(0, dtype=x.dtype, device=x.device)
+                self._empty_bias = cached
+            bias_h = cached
+
+        N = self.out_features
+        out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        if _PROFILE_PADDED_GROUPS and x.is_cuda:
+            torch.cuda.synchronize(x.device)
+            t0 = time.perf_counter()
+        _fused_int4_gemm_padded_groups_kernel[grid](
+            a_2d, self.qweight, self.scales, self.qzeros, bias_h, out,
+            M, N, self.padded_in_features, self.in_features,
+            a_2d.stride(0), a_2d.stride(1),
+            self.qweight.stride(0), self.qweight.stride(1),
+            self.scales.stride(0), self.scales.stride(1),
+            self.qzeros.stride(0), self.qzeros.stride(1),
+            out.stride(0), out.stride(1),
+            HAS_BIAS=self._has_bias,
+            ORIG_GROUPSIZE=self.groupsize,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            NUM_K_GROUPS=NUM_K_GROUPS,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        if _PROFILE_PADDED_GROUPS and x.is_cuda:
+            torch.cuda.synchronize(x.device)
+            _PADDED_GROUPS_STATS["calls"] += 1.0
+            _PADDED_GROUPS_STATS["seconds"] += time.perf_counter() - t0
+        if orig_dtype == torch.float32:
+            out = out.to(torch.float32)
+        if x_dim == 2:
+            return out
+        return out.reshape(*leading_shape, self.out_features)
+
+    @torch.no_grad()
+    def warmup(self, m_values=(32, 128, 256, 1024, 2250)) -> None:
+        device = self.qweight.device
+        dtype = (
+            self.scales.dtype
+            if self.scales.dtype in (torch.float16, torch.bfloat16)
+            else torch.float16
+        )
+        for m in m_values:
+            if m <= 0:
+                continue
+            x = torch.zeros((int(m), self.in_features), dtype=dtype, device=device)
+            _ = self.forward(x)
+        torch.cuda.synchronize() if device.type == "cuda" else None
+
+    def _apply(self, fn, recurse=True):
+        qweight_before = self.qweight
+        qzeros_before = self.qzeros
+        result = super()._apply(fn, recurse=recurse)
+        if self.qweight.dtype != torch.int32:
+            self.qweight = qweight_before.to(self.qweight.device)
+        if self.qzeros.dtype != torch.int32:
+            self.qzeros = qzeros_before.to(self.qzeros.device)
+        if self.scales.dtype not in (torch.float16, torch.bfloat16):
+            self.scales = self.scales.to(torch.float16)
+        return result
 
 
 class FusedInt4Linear(torch.nn.Module):
@@ -456,7 +1095,18 @@ class FusedInt4Linear(torch.nn.Module):
             else:
                 BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 32, 4, 3
         elif M <= 1024:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+            if N >= 2048 and K == 1024:
+                BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 3
+            else:
+                BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+        elif N >= 2048 and K >= 2048:
+            # Large-M Cosmos Transfer2.5 704x704 path. RTX 3090 sweep:
+            #   M=21600 K=N=2048      -> 128x128 nkg=1 ns=3 ~3.2ms median
+            #   M=21600 K=2048 N=8192 -> 128x128 nkg=1 ns=3 ~12.7ms
+            #   M=21600 K=8192 N=2048 -> 128x128 nkg=1 ns=3 ~12.2ms
+            # This replaces the old 64x64 large-M default for these shapes.
+            BLOCK_M, BLOCK_N, num_warps = 128, 128, 4
+            num_stages = 3
         elif N >= 2048 and K <= 1536:
             BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 2
         else:
@@ -479,7 +1129,9 @@ class FusedInt4Linear(torch.nn.Module):
         #   K=3680 N=1280: nkg=1 416us beats nkg=2 424us
         # Wide-N (N>=2048) hits the BM=128 BN=64 branch and prefers nkg=2 there:
         #   K=1280 N=3680: nkg=2 ≈ 387us beats nkg=1.
-        if M > 1024:
+        if 256 < M <= 1024 and N >= 2048 and K == 1024:
+            NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
+        elif M > 1024:
             if N >= 2048 and K <= 1536:
                 NUM_K_GROUPS = min(NUM_K_GROUPS, 2)
             else:
@@ -519,6 +1171,9 @@ class FusedInt4Linear(torch.nn.Module):
         else:
             a_2d = x.reshape(-1, self.in_features)
             M = a_2d.shape[0]
+        if _PROFILE_SHAPES:
+            key = ("fused", int(M), self.in_features, self.out_features)
+            _SHAPE_STATS[key] = _SHAPE_STATS.get(key, 0) + 1
 
         cfg = self._cfg_cache.get(M)
         if cfg is None:
